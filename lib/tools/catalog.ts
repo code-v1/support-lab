@@ -1,5 +1,23 @@
 export const catalog = [
   {
+    name: "get_product_guide",
+    description:
+      "Read official product instructions: reports (period, columns, apply preview, download and saved selections), access, or engineering handoff/update policy. Product documentation is separate from learned repair recipes.",
+    mutates: false,
+  },
+  {
+    name: "get_report_builder",
+    description:
+      "Inspect the customer's applied and draft report period/columns, preview state and download state. Teach the customer how to use the controls; do not silently change their selections.",
+    mutates: false,
+  },
+  {
+    name: "escalate_to_engineering",
+    description:
+      "Create an evidence-backed engineering handoff for an unrecoverable renderer defect. Requires job inspection, logs and one failed export reproduction. Include customer impact, reproduction steps, expected and actual behavior. Keeps the support ticket open with engineering; this is not a repair and provides no ETA.",
+    mutates: true,
+  },
+  {
     name: "get_customer",
     description: "Retrieve the customer record for this call.",
     mutates: false,
@@ -37,7 +55,7 @@ export const catalog = [
   {
     name: "verify_fix",
     description:
-      "Attempt the customer action against DemoDesk to verify the outcome.",
+      "Attempt the customer's action against DemoDesk. Choose action export when a report was requested; a successful login alone does not verify a report. A customer's actual report download also provides evidence.",
     mutates: false,
   },
   {
@@ -59,7 +77,7 @@ export const catalog = [
   {
     name: "update_ticket",
     description:
-      "Update a ticket; resolved status requires deterministic verification.",
+      "Save diagnosis and repair details with status investigating. Resolved status requires verified repair and assessed customer confirmation; the simulator handles final closure.",
     mutates: true,
   },
   {

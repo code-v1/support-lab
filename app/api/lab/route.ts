@@ -15,16 +15,20 @@ import { validateRecipe } from "@/lib/learning/workflows";
 import { catalog } from "@/lib/tools/catalog";
 import { isSameOrigin } from "@/lib/http";
 import { modelConfigSchema as modelConfig } from "@/lib/ai/schema";
+import { scenarioIds, createCase } from "@/lib/simulation/cases";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-const scenario = z.enum(["account_locked", "export_config", "export_stuck"]);
+const scenario = z.enum([...scenarioIds, "random"]);
 const schema = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("start"),
     customerId: z.string(),
     scenario,
     maxTurns: z.number().int().min(2).max(12),
+    seed: z.string().trim().min(1).max(64).optional(),
+    difficulty: z.enum(["standard", "challenge"]).optional(),
+    followUp: z.boolean().optional(),
   }),
   z.object({
     action: z.enum(["step", "pause", "resume", "cancel", "learn"]),
@@ -68,7 +72,7 @@ export async function POST(request: Request) {
     const input = schema.parse(await request.json());
     switch (input.action) {
       case "start":
-        start(input.customerId, input.scenario, input.maxTurns);
+        start(input.customerId, input.scenario, input.maxTurns, input);
         break;
       case "step":
         await step(input.callId);
@@ -92,7 +96,7 @@ export async function POST(request: Request) {
           input.callId,
         );
         run(
-          "UPDATE tickets SET status='escalated' WHERE call_id=? AND status!='resolved'",
+          "UPDATE tickets SET status='escalated' WHERE call_id=? AND status NOT IN ('resolved','engineering')",
           input.callId,
         );
         break;
@@ -101,7 +105,10 @@ export async function POST(request: Request) {
         break;
       case "inject":
         assertIdle();
-        inject(input.customerId, input.scenario);
+        {
+          const selected = createCase(input.scenario);
+          inject(input.customerId, selected.scenario, selected.scenarioCase);
+        }
         break;
       case "settings":
         assertIdle();

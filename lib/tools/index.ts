@@ -1,11 +1,17 @@
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import { all, customer, getCall, log, one, run } from "@/lib/db";
-import { login, exportReport } from "@/lib/demodesk";
+import { login, exportReport, reportView } from "@/lib/demodesk";
 import { hasVerification } from "@/lib/evaluation";
+import { hasCustomerConfirmation } from "@/lib/evaluation/conversation";
 import { settings } from "@/lib/ai/router";
 import { validateRecipe } from "@/lib/learning/workflows";
 import { catalog } from "./catalog";
+import { productGuides } from "@/lib/reporting";
+import {
+  fileEngineeringHandoff,
+  type EngineeringInput,
+} from "@/lib/engineering";
 import type { Article, Workflow, Ticket } from "@/lib/types";
 
 const empty = z.object({}).strict();
@@ -20,10 +26,27 @@ export const toolSchemas: Record<string, z.ZodType> = {
       "retry_export",
       "verify_fix",
       "reproduce_export",
+      "get_report_builder",
     ].map((name) => [name, empty]),
   ),
   update_account_status: z.object({ status: z.literal("active") }).strict(),
+  verify_fix: z
+    .object({ action: z.enum(["login", "export"]).optional() })
+    .strict(),
   search_knowledge: z.object({ query: z.string().min(1).max(250) }).strict(),
+  get_product_guide: z
+    .object({ topic: z.enum(["reports", "access", "engineering"]) })
+    .strict(),
+  escalate_to_engineering: z
+    .object({
+      severity: z.enum(["low", "medium", "high"]),
+      summary: z.string().min(10).max(180),
+      customerImpact: z.string().min(10).max(600),
+      reproductionSteps: z.array(z.string().min(5).max(300)).min(2).max(6),
+      expectedResult: z.string().min(5).max(600),
+      actualResult: z.string().min(5).max(600),
+    })
+    .strict(),
   run_workflow: z.object({ workflowId: z.string().max(100) }).strict(),
   create_ticket: z.object({ subject: z.string().min(1).max(200) }).strict(),
   update_ticket: z
@@ -121,7 +144,17 @@ export class LocalSupportBackend implements SupportBackend {
           jobStatus: account.export_job,
           supportedFormats: ["csv"],
           permission: account.role,
+          report: reportView(account.id),
         };
+      case "get_report_builder":
+        return reportView(account.id);
+      case "get_product_guide":
+        return productGuides[input.topic as keyof typeof productGuides];
+      case "escalate_to_engineering":
+        return fileEngineeringHandoff(
+          callId,
+          input as unknown as EngineeringInput,
+        );
       case "update_account_status": {
         if (account.status !== "locked")
           return {
@@ -154,16 +187,40 @@ export class LocalSupportBackend implements SupportBackend {
           format: "csv",
         };
       case "retry_export":
+        if (account.recovery_failures > 0) {
+          run(
+            "UPDATE customers SET recovery_failures=recovery_failures-1 WHERE id=?",
+            account.id,
+          );
+          log(
+            account.id,
+            "warn",
+            "export.worker_busy",
+            "Export recovery worker was temporarily busy; no repair applied.",
+          );
+          return {
+            ok: false,
+            code: "EXPORT_WORKER_BUSY",
+            error:
+              "The recovery worker is temporarily busy. Inspect the current job and retry once; no repair was applied.",
+          };
+        }
         if (account.export_job === "stuck")
           run("UPDATE customers SET export_job='idle' WHERE id=?", account.id);
         return { ...exportReport(account.id), previousJob: account.export_job };
       case "verify_fix": {
         // Public reproduction uses observed tool context, never the private scenario label.
         const exportObserved = one(
-          "SELECT id FROM activities WHERE call_id=? AND name IN ('inspect_export_job','retry_export','repair_export_config','reproduce_export')",
+          "SELECT id FROM activities WHERE call_id=? AND name IN ('inspect_export_job','get_report_builder','retry_export','repair_export_config','reproduce_export','customer.download_report')",
           callId,
         );
-        return exportObserved ? exportReport(account.id) : login(account.id);
+        const action = input.action || (exportObserved ? "export" : "login");
+        return {
+          ...(action === "export"
+            ? exportReport(account.id)
+            : login(account.id)),
+          verifiedAction: action,
+        };
       }
       case "search_knowledge": {
         const query = String(input.query).toLowerCase();
@@ -197,11 +254,15 @@ export class LocalSupportBackend implements SupportBackend {
         if (!workflow) throw new Error("Active workflow not found.");
         const recipe = validateRecipe(JSON.parse(workflow.recipe));
         const allowed =
-          recipe.condition === "account_locked"
-            ? account.status === "locked"
-            : recipe.condition === "invalid_export_format"
-              ? account.export_format !== "csv"
-              : account.export_job === "stuck";
+          recipe.condition === "compound_export"
+            ? account.status === "locked" &&
+              account.export_format !== "csv" &&
+              account.export_job === "stuck"
+            : recipe.condition === "account_locked"
+              ? account.status === "locked"
+              : recipe.condition === "invalid_export_format"
+                ? account.export_format !== "csv"
+                : account.export_job === "stuck";
         if (!allowed)
           throw new Error(
             "Workflow precondition is not met. Inspect this account before choosing a recipe.",
@@ -254,13 +315,28 @@ export class LocalSupportBackend implements SupportBackend {
           throw new Error(
             "Ticket cannot be resolved until an actual customer action passes verification.",
           );
+        if (input.status === "resolved" && !hasCustomerConfirmation(callId))
+          throw new Error(
+            "Keep the ticket investigating until the customer confirms completion with no outstanding questions and a clear, evidence-supported explanation. Save repair details now; the simulator will close the ticket after confirmation.",
+          );
+        const note = String(input.resolution).trim();
+        // Follow-up notes and final closure must not discard the repair evidence.
+        const resolution = ticket.resolution?.trim()
+          ? !note || ticket.resolution.includes(note)
+            ? ticket.resolution
+            : `${ticket.resolution}\n\n${note}`
+          : note;
+        const status =
+          ticket.status === "engineering"
+            ? "engineering"
+            : String(input.status);
         run(
           "UPDATE tickets SET status=?,resolution=? WHERE call_id=?",
-          String(input.status),
-          String(input.resolution),
+          status,
+          resolution,
           callId,
         );
-        return { ok: true, id: ticket.id, status: input.status };
+        return { ok: true, id: ticket.id, status };
       }
       case "reproduce_export": {
         const { reproduceExport } = await import("@/lib/simulation/browser");

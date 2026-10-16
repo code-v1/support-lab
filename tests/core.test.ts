@@ -21,11 +21,14 @@ import { all, batch, customer, getCall, one, run } from "@/lib/db";
 import { exportReport, inject, login, observe } from "@/lib/demodesk";
 import { backend } from "@/lib/tools";
 import { evaluate, hasVerification } from "@/lib/evaluation";
+import { recordCompletion } from "@/lib/evaluation/conversation";
 import { configuration, settings } from "@/lib/ai/router";
 import { validateRecipe } from "@/lib/learning/workflows";
 import { learn } from "@/lib/learning";
-import { reset, start } from "@/lib/simulation/orchestrator";
+import { addMessage, reset, start } from "@/lib/simulation/orchestrator";
 import type { Article, Workflow } from "@/lib/types";
+import { readCase } from "@/lib/simulation/cases";
+import { useReportControls } from "@/lib/demodesk";
 
 beforeEach(() => {
   process.env.DATABASE_PATH = join(
@@ -155,12 +158,83 @@ describe("bounded tools and verification", () => {
         status: "resolved",
         resolution: "Verified login",
       }),
+    ).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("customer confirms"),
+    });
+    addMessage(
+      c.id,
+      "support",
+      "I unlocked the account and verified successful sign-in.",
+    );
+    const confirmation = addMessage(
+      c.id,
+      "customer",
+      "It works, and that answers my questions. Thank you.",
+    );
+    recordCompletion(c.id, confirmation, {
+      customerSatisfied: true,
+      explanationComplete: true,
+      evidenceSupported: true,
+      openQuestions: [],
+      reason: "Customer confirms completion.",
+    });
+    expect(
+      await backend.execute(c.id, "update_ticket", {
+        status: "resolved",
+        resolution: "Verified login",
+      }),
     ).toMatchObject({ ok: true });
   });
   it("blocks learning for unverified fixes", async () => {
     const c = call();
     await expect(learn(c.id)).rejects.toThrow("verified");
     expect(all("SELECT id FROM articles")).toHaveLength(0);
+  });
+  it("appends follow-up notes and preserves long repair evidence during closure", async () => {
+    const c = call();
+    await backend.execute(c.id, "create_ticket", { subject: "Account access" });
+    const repair = "Verified account repair. ".repeat(65);
+    const followup =
+      "Explained that the logs do not identify the actor. ".repeat(30);
+    await backend.execute(c.id, "update_ticket", {
+      status: "investigating",
+      resolution: repair,
+    });
+    await backend.execute(c.id, "update_ticket", {
+      status: "investigating",
+      resolution: followup,
+    });
+    await unlock(c.id);
+    addMessage(
+      c.id,
+      "support",
+      "I restored access and verified sign-in. The logs do not identify who made the attempts.",
+    );
+    const messageId = addMessage(
+      c.id,
+      "customer",
+      "That answers my concern. Everything works, thank you.",
+    );
+    recordCompletion(c.id, messageId, {
+      customerSatisfied: true,
+      explanationComplete: true,
+      evidenceSupported: true,
+      openQuestions: [],
+      reason: "Customer accepts the repair and explanation.",
+    });
+    expect(
+      await backend.execute(c.id, "update_ticket", {
+        status: "resolved",
+        resolution: "",
+      }),
+    ).toMatchObject({ ok: true });
+    const ticket = one<{ resolution: string }>(
+      "SELECT resolution FROM tickets WHERE call_id=?",
+      c.id,
+    )!;
+    expect(ticket.resolution).toBe(`${repair.trim()}\n\n${followup.trim()}`);
+    expect(ticket.resolution.length).toBeGreaterThan(2000);
   });
   it("cannot start an AI simulation without keys", () => {
     delete process.env.GOOGLE_GENERATIVE_AI_API_KEY;
@@ -183,6 +257,60 @@ describe("bounded tools and verification", () => {
   });
 });
 describe("learning and replay", () => {
+  it("learns a compound workflow only after all three observed repairs succeed", async () => {
+    const current = start("maya", "export_multi_fault", 8);
+    await backend.execute(current.id, "get_account_status", {});
+    await backend.execute(current.id, "update_account_status", {
+      status: "active",
+    });
+    await backend.execute(current.id, "inspect_export_job", {});
+    await backend.execute(current.id, "repair_export_config", {});
+    await backend.execute(current.id, "retry_export", {});
+    await backend.execute(current.id, "verify_fix", { action: "export" });
+    run("UPDATE calls SET status='resolved',verified=1 WHERE id=?", current.id);
+    await learn(current.id);
+    const workflow = one<Workflow>("SELECT * FROM workflows")!;
+    const recipe = validateRecipe(JSON.parse(workflow.recipe));
+    expect(recipe.condition).toBe("compound_export");
+    expect(recipe.steps.map((step) => step.tool)).toEqual([
+      "get_account_status",
+      "update_account_status",
+      "inspect_export_job",
+      "repair_export_config",
+      "retry_export",
+      "verify_fix",
+    ]);
+    reset(true);
+    const replay = start("jules", "export_multi_fault", 8);
+    expect(
+      await backend.execute(replay.id, "run_workflow", {
+        workflowId: workflow.id,
+      }),
+    ).toMatchObject({ ok: true });
+    expect(hasVerification(replay.id)).toBe(true);
+  });
+  it("learns a coaching article from actual customer UI actions without creating a repair macro", async () => {
+    const current = start("jules", "report_guidance", 8, {
+      seed: "coaching-learning",
+    });
+    const goal = readCase(current);
+    useReportControls("jules", {
+      action: "choose_range",
+      range: goal.targetRange,
+    });
+    useReportControls("jules", {
+      action: "choose_columns",
+      columns: goal.targetColumns,
+    });
+    useReportControls("jules", { action: "apply_preview" });
+    useReportControls("jules", { action: "download_report" });
+    run("UPDATE calls SET status='resolved',verified=1 WHERE id=?", current.id);
+    await learn(current.id);
+    expect(one<Article>("SELECT * FROM articles")?.signature).toBe(
+      "report_builder_guidance",
+    );
+    expect(all("SELECT * FROM workflows")).toHaveLength(0);
+  });
   it("does not mistake a no-op configuration check for the cause of a stuck export", async () => {
     const c = call("oliver", "export_stuck");
     expect(

@@ -77,6 +77,8 @@ test("waits for each voice, uses different speakers, pauses, and resumes", async
             knowledge_used: 0,
             workflow_used: 0,
             verified: 0,
+            repair_verified: 0,
+            closing_customer_message_id: null,
             error: null,
             learning_status: "pending",
             batch: 1,
@@ -90,17 +92,24 @@ test("waits for each voice, uses different speakers, pauses, and resumes", async
         snapshot.messages.push({
           id: steps,
           call_id: "test-only-call",
-          role: steps === 2 ? "support" : "customer",
+          role: steps === 2 || steps === 4 ? "support" : "customer",
+          kind: steps === 4 ? "closing" : "dialogue",
           text:
             steps === 1
               ? "I cannot sign in."
               : steps === 2
                 ? "I checked and repaired your account."
-                : "I can sign in now.",
+                : steps === 3
+                  ? "I can sign in now."
+                  : "You're all set, Maya. Thanks for contacting DemoDesk support—have a good day.",
           created_at: new Date().toISOString(),
         });
         snapshot.calls[0].turns = 1;
         if (steps === 3) {
+          snapshot.calls[0].closing_customer_message_id = 3;
+          snapshot.calls[0].repair_verified = 1;
+        }
+        if (steps === 4) {
           snapshot.calls[0].status = "resolved";
           snapshot.calls[0].verified = 1;
           snapshot.calls[0].learning_status = "Test-only verified outcome";
@@ -150,7 +159,39 @@ test("waits for each voice, uses different speakers, pauses, and resumes", async
   expect(steps).toBe(2);
   await page.getByRole("button", { name: "Resume", exact: true }).click();
   await expect(
+    page.getByText("I can sign in now.", { exact: true }),
+  ).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => (window as unknown as { __spoken: unknown[] }).__spoken.length,
+      ),
+    )
+    .toBe(3);
+  expect(steps).toBe(3);
+  await page.evaluate(() =>
+    (window as unknown as { __endSpeech: () => void }).__endSpeech(),
+  );
+  await expect(
     page.getByRole("heading", { name: "Verified resolution", exact: true }),
   ).toBeVisible();
-  expect(steps).toBe(3);
+  expect(steps).toBe(4);
+  await expect(
+    page.getByText(
+      "You're all set, Maya. Thanks for contacting DemoDesk support—have a good day.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => (window as unknown as { __spoken: unknown[] }).__spoken.length,
+      ),
+    )
+    .toBe(4);
+  await page.evaluate(() =>
+    (window as unknown as { __endSpeech: () => void }).__endSpeech(),
+  );
+  await page.waitForTimeout(600);
+  expect(steps).toBe(4);
 });

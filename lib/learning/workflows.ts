@@ -15,6 +15,7 @@ export const recipeSchema = z
       "account_locked",
       "invalid_export_format",
       "stuck_export_job",
+      "compound_export",
     ]),
     steps: z
       .array(
@@ -59,6 +60,15 @@ export function validateRecipe(input: unknown): Recipe {
       "get_account_status",
       "get_application_logs",
       "inspect_export_job",
+      "retry_export",
+      "verify_fix",
+    ],
+    compound_export: [
+      "get_account_status",
+      "get_application_logs",
+      "inspect_export_job",
+      "update_account_status",
+      "repair_export_config",
       "retry_export",
       "verify_fix",
     ],

@@ -30,6 +30,7 @@ import {
   Search,
   Settings2,
   ShieldCheck,
+  Shuffle,
   Square,
   Terminal,
   TrendingUp,
@@ -40,8 +41,17 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import type { Call, Customer, Scenario, Settings, Snapshot } from "@/lib/types";
+import type {
+  Call,
+  Customer,
+  Scenario,
+  ScenarioChoice,
+  ScenarioCase,
+  Settings,
+  Snapshot,
+} from "@/lib/types";
 import { useVoice } from "@/lib/voice/useVoice";
+import { playbackLock, usePlaybackOwner } from "@/lib/voice/usePlaybackOwner";
 import {
   defaultModel,
   defaultReasoning,
@@ -85,6 +95,30 @@ const scenarios: {
     description: "An export keeps processing indefinitely.",
     icon: Clock3,
     tag: "Job recovery",
+  },
+  {
+    id: "report_guidance",
+    name: "Report builder coaching",
+    description:
+      "Help a customer select the right period and columns, apply a preview and download.",
+    icon: CircleHelp,
+    tag: "Knowledge gap",
+  },
+  {
+    id: "export_multi_fault",
+    name: "Several things are wrong",
+    description:
+      "An account problem hides multiple report failures. A partial fix is not enough.",
+    icon: Boxes,
+    tag: "Multi-step diagnosis",
+  },
+  {
+    id: "export_engineering",
+    name: "Broken report renderer",
+    description:
+      "Support cannot repair the feature. Investigate and hand it to engineering.",
+    icon: Code2,
+    tag: "Engineering handoff",
   },
 ];
 const scenarioName = (id: string) =>
@@ -148,8 +182,14 @@ export default function Dashboard() {
     [busy, setBusy] = useState(false);
   const [selectedCustomer, setSelectedCustomer] = useState("maya"),
     [selectedScenario, setSelectedScenario] =
-      useState<Scenario>("account_locked"),
-    [maxTurns, setMaxTurns] = useState(6);
+      useState<ScenarioChoice>("random"),
+    [maxTurns, setMaxTurns] = useState(8);
+  const [caseSeed, setCaseSeed] = useState(""),
+    [difficulty, setDifficulty] = useState<"standard" | "challenge">(
+      "challenge",
+    ),
+    [allowFollowUp, setAllowFollowUp] = useState(true),
+    [comparisonSeed, setComparisonSeed] = useState("all");
   const [selectedCall, setSelectedCall] = useState<string | null>(null),
     [resetOpen, setResetOpen] = useState(false),
     [preserve, setPreserve] = useState(true),
@@ -157,18 +197,34 @@ export default function Dashboard() {
   const [draft, setDraft] = useState<Settings | null>(null),
     [crmCustomer, setCrmCustomer] = useState("maya");
   const voice = useVoice(),
-    runner = useRef(false),
-    state = useRef(data);
-  state.current = data;
+    runner = useRef(false);
+  const controlEpoch = useRef(0),
+    locallyBlocked = useRef(false);
+  const runningCallId = useRef<string | null>(null);
+  const snapshotEpoch = useRef(0),
+    pendingActions = useRef(0);
+  const [playbackTick, wakePlayback] = useState(0);
+  const [replaying, setReplaying] = useState(false);
   const active = data?.calls.find((c) => !terminal(c));
   const activeId = active?.id,
     activeStatus = active?.status;
+  function interruptPlayback() {
+    controlEpoch.current++;
+    voice.stop();
+    wakePlayback((value) => value + 1);
+  }
+  const ownership = usePlaybackOwner(!!active, busy, interruptPlayback);
+  const runningStatus = data?.calls.find(
+    (c) => c.id === runningCallId.current,
+  )?.status;
   const refresh = useCallback(async () => {
+    const epoch = snapshotEpoch.current;
     try {
       const response = await fetch("/api/lab");
       if (!response.ok) throw new Error("Could not load the local database.");
       const value = await response.json();
-      setData(value);
+      if (epoch === snapshotEpoch.current && !pendingActions.current)
+        setData(value);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -179,6 +235,8 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, [refresh]);
   async function action(body: object, quiet = false) {
+    const epoch = ++snapshotEpoch.current;
+    pendingActions.current++;
     if (!quiet) setLoading(true);
     setError("");
     try {
@@ -189,37 +247,91 @@ export default function Dashboard() {
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Request failed");
-      setData(result);
+      if (epoch === snapshotEpoch.current) setData(result);
       return result as Snapshot;
     } catch (e) {
       setError((e as Error).message);
       return null;
     } finally {
+      pendingActions.current--;
       if (!quiet) setLoading(false);
     }
   }
-  // Each server step emits one speaker; wait for speech before advancing the agents.
+  // A step emits at most one speaker; review retries do not repeat dialogue.
   useEffect(() => {
-    if (activeStatus !== "running" || runner.current) return;
+    if (
+      activeStatus !== "running" ||
+      runner.current ||
+      !ownership.controlling ||
+      locallyBlocked.current
+    )
+      return;
     const timer = setTimeout(
       async () => {
-        if (runner.current) return;
+        if (runner.current || !ownership.canControl() || locallyBlocked.current)
+          return;
         runner.current = true;
+        runningCallId.current = activeId || null;
+        const epoch = controlEpoch.current;
         setBusy(true);
         try {
-          const before = new Set(state.current?.messages.map((m) => m.id));
+          // Ownership can move between tabs. Read a fresh baseline so an older
+          // tab cannot replay messages created while it was only observing.
+          const response = await fetch("/api/lab");
+          if (!response.ok)
+            throw new Error("Could not refresh the live conversation.");
+          const latest: Snapshot = await response.json();
+          if (
+            epoch !== controlEpoch.current ||
+            !ownership.canControl() ||
+            locallyBlocked.current
+          )
+            return;
+          setData(latest);
+          if (latest.calls.find((c) => c.id === activeId)?.status !== "running")
+            return;
+          const pendingMessage = latest.messages
+            .filter((m) => m.call_id === activeId && m.role !== "system")
+            .at(-1);
+          if (
+            pendingMessage &&
+            !voice.hasPlayed(pendingMessage) &&
+            !voice.muted &&
+            !voice.fast &&
+            "speechSynthesis" in window
+          ) {
+            const playback = await voice.play(
+              [pendingMessage],
+              false,
+              latest.customers.find((c) => c.id === active?.customer_id)
+                ?.voice || 0,
+            );
+            if (
+              playback === "failed" &&
+              epoch === controlEpoch.current &&
+              ownership.canControl()
+            ) {
+              await action({ action: "pause", callId: activeId }, true);
+              setError(
+                "Audio playback stopped unexpectedly. The call is paused; Resume retries this message before continuing.",
+              );
+            }
+            return;
+          }
+          const before = new Set(latest.messages.map((m) => m.id));
           const result = await action(
             { action: "step", callId: activeId },
             true,
           );
           if (
             result &&
-            state.current?.calls.find((c) => c.id === activeId)?.status !==
-              "paused" &&
-            state.current?.calls.find((c) => c.id === activeId)?.status !==
-              "cancelled"
-          )
-            await voice.play(
+            epoch === controlEpoch.current &&
+            ownership.canControl() &&
+            !locallyBlocked.current &&
+            result.calls.find((c) => c.id === activeId)?.status !== "paused" &&
+            result.calls.find((c) => c.id === activeId)?.status !== "cancelled"
+          ) {
+            const playback = await voice.play(
               result.messages.filter(
                 (m) => m.call_id === activeId && !before.has(m.id),
               ),
@@ -227,6 +339,26 @@ export default function Dashboard() {
               result.customers.find((c) => c.id === active?.customer_id)
                 ?.voice || 0,
             );
+            if (
+              playback === "failed" &&
+              epoch === controlEpoch.current &&
+              ownership.canControl()
+            ) {
+              if (
+                result.calls.find((c) => c.id === activeId)?.status ===
+                "running"
+              )
+                await action({ action: "pause", callId: activeId }, true);
+              setError(
+                result.calls.find((c) => c.id === activeId)?.status ===
+                  "running"
+                  ? "Audio playback stopped unexpectedly. The call is paused; Resume retries this message before continuing."
+                  : "Audio playback stopped before finishing. Use Replay voice to hear the completed conversation.",
+              );
+            }
+          }
+        } catch (e) {
+          setError((e as Error).message);
         } finally {
           runner.current = false;
           setBusy(false);
@@ -237,10 +369,28 @@ export default function Dashboard() {
     return () => clearTimeout(timer);
     // Speech settings take effect between utterances. Polling does not launch parallel steps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeId, activeStatus, busy, voice.fast]);
+  }, [
+    activeId,
+    activeStatus,
+    busy,
+    voice.fast,
+    ownership.controlling,
+    playbackTick,
+  ]);
   useEffect(() => {
     if (voice.muted || voice.fast) voice.stop();
   }, [voice.muted, voice.fast]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (runningStatus === "paused" || runningStatus === "cancelled")
+      interruptPlayback();
+  }, [runningStatus]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    // A resume from another tab also releases this tab's local pause barrier.
+    if (activeStatus === "running") {
+      locallyBlocked.current = false;
+      wakePlayback((value) => value + 1);
+    }
+  }, [activeStatus]);
   if (!data)
     return (
       <div className="startup">
@@ -250,16 +400,40 @@ export default function Dashboard() {
       </div>
     );
   const completed = data.calls.filter((c) =>
-      ["resolved", "failed"].includes(c.status),
+      ["resolved", "escalated", "incomplete", "failed"].includes(c.status),
     ),
     resolved = completed.filter((c) => c.verified),
+    handled = completed.filter((c) => c.outcome_verified || c.verified),
     rate = completed.length
-      ? Math.round((resolved.length / completed.length) * 100)
+      ? Math.round((handled.length / completed.length) * 100)
       : 0;
   const call =
     data.calls.find((c) => c.id === (selectedCall || active?.id)) ||
     data.calls[0];
   const callCustomer = data.customers.find((c) => c.id === call?.customer_id);
+  const caseDetails: ScenarioCase | null = call?.scenario_case
+    ? JSON.parse(call.scenario_case)
+    : null;
+  const callPerformance = data.performance?.find(
+    (entry) => entry.call_id === call?.id,
+  );
+  const comparedCallIds = new Set(
+    completed
+      .filter(
+        (entry) =>
+          comparisonSeed === "all" || entry.scenario_seed === comparisonSeed,
+      )
+      .map((entry) => entry.id),
+  );
+  const comparedPerformance = (data.performance || []).filter((entry) =>
+    comparedCallIds.has(entry.call_id),
+  );
+  const engineeringHandoff = data.engineering?.find(
+    (entry) => entry.call_id === call?.id,
+  );
+  const completionCheck = data.completionChecks
+    ?.filter((check) => check.call_id === call?.id)
+    .at(-1);
   const transcript = data.messages.filter((m) => m.call_id === call?.id),
     activities = data.activities.filter((a) => a.call_id === call?.id);
   const tokens = data.usage.reduce(
@@ -270,16 +444,52 @@ export default function Dashboard() {
     ? (completed.reduce((n, c) => n + c.turns, 0) / completed.length).toFixed(1)
     : "—";
   async function startCall() {
-    voice.stop();
+    interruptPlayback();
+    locallyBlocked.current = false;
+    ownership.claim();
     const result = await action({
       action: "start",
       customerId: selectedCustomer,
       scenario: selectedScenario,
       maxTurns,
+      seed: caseSeed.trim() || undefined,
+      difficulty,
+      followUp: allowFollowUp,
     });
     if (result) {
       setSelectedCall(result.calls[0]?.id || null);
       setTab("Live Simulation");
+    }
+  }
+  async function replayConversation() {
+    if (replaying || voice.speaking || runner.current) return;
+    setReplaying(true);
+    try {
+      if (!("locks" in navigator))
+        throw new Error(
+          "This browser cannot coordinate audio playback across tabs.",
+        );
+      await navigator.locks.request(
+        playbackLock,
+        { ifAvailable: true },
+        async (lock) => {
+          if (!lock) {
+            setNotice(
+              "Live playback is running in another tab. Finish or stop that conversation before replaying here.",
+            );
+            return;
+          }
+          if (
+            (await voice.play(transcript, true, callCustomer?.voice)) ===
+            "failed"
+          )
+            setError(
+              "Audio replay stopped unexpectedly. You can retry replay.",
+            );
+        },
+      );
+    } finally {
+      setReplaying(false);
     }
   }
   const go = (name: string) => {
@@ -293,7 +503,7 @@ export default function Dashboard() {
           <span className="eyebrow">SIMULATION SETUP</span>
           <h2>Put your agent to the test</h2>
         </div>
-        <span className="mini-label">3 scenarios available</span>
+        <span className="mini-label">6 scenarios · seeded variations</span>
       </div>
       <div className="field-heading">
         <span>01</span> Choose a customer
@@ -327,6 +537,26 @@ export default function Dashboard() {
         <span>02</span> Select a support scenario
       </div>
       <div className="scenarios">
+        <button
+          className={`scenario ${selectedScenario === "random" ? "selected" : ""}`}
+          onClick={() => setSelectedScenario("random")}
+        >
+          <div className="scenario-icon">
+            <Shuffle size={19} />
+          </div>
+          <div>
+            <strong>Random challenge</strong>
+            <p>
+              Choose a case without telling the support agent which path will
+              solve it.
+            </p>
+          </div>
+          <i className="radio">
+            {selectedScenario === "random" && (
+              <Circle size={8} fill="currentColor" />
+            )}
+          </i>
+        </button>
         {scenarios.map((s) => (
           <button
             key={s.id}
@@ -347,6 +577,39 @@ export default function Dashboard() {
             </i>
           </button>
         ))}
+      </div>
+      <div className="case-controls">
+        <label>
+          Variation level
+          <select
+            aria-label="Variation level"
+            value={difficulty}
+            onChange={(event) =>
+              setDifficulty(event.target.value as "standard" | "challenge")
+            }
+          >
+            <option value="standard">Standard · direct path</option>
+            <option value="challenge">Challenge · extra conditions</option>
+          </select>
+        </label>
+        <label>
+          Case seed
+          <input
+            aria-label="Case seed"
+            maxLength={64}
+            placeholder="Leave blank for a new random seed"
+            value={caseSeed}
+            onChange={(event) => setCaseSeed(event.target.value)}
+          />
+        </label>
+        <label className="followup-control">
+          <input
+            type="checkbox"
+            checked={allowFollowUp}
+            onChange={(event) => setAllowFollowUp(event.target.checked)}
+          />{" "}
+          Allow one related customer follow-up
+        </label>
       </div>
       <div className="setup-footer">
         <label className="switch-label">
@@ -385,6 +648,13 @@ export default function Dashboard() {
           start a real call.
         </div>
       )}
+      <p className="panel-note">
+        One turn is a customer–support exchange. The customer can confirm or ask
+        a follow-up after the final response. Unfinished calls are marked
+        incomplete and escalated. Coaching cases work best with 6–8 turns. Reuse
+        the same seed, variation level and customer to repeat the setup; model
+        replies can still vary.
+      </p>
     </section>
   );
   const activityPanel = (
@@ -649,11 +919,11 @@ export default function Dashboard() {
                   icon={Headphones}
                 />
                 <Metric
-                  label="RESOLUTION RATE"
+                  label="CORRECT OUTCOME RATE"
                   value={completed.length ? `${rate}%` : "—"}
                   detail={
                     completed.length
-                      ? `${resolved.length} of ${completed.length} verified`
+                      ? `${handled.length} of ${completed.length} verified outcomes`
                       : "Measured against real app state"
                   }
                   icon={CheckCircle2}
@@ -830,7 +1100,10 @@ export default function Dashboard() {
                                 : "neutral"
                         }
                       >
-                        {call.status}
+                        {call.status === "running" &&
+                        call.closing_customer_message_id
+                          ? "closing"
+                          : call.status}
                       </Badge>
                       <strong>{scenarioName(call.scenario)}</strong>
                       <span>
@@ -841,6 +1114,7 @@ export default function Dashboard() {
                       <button
                         className="icon-button"
                         aria-label={voice.muted ? "Unmute" : "Mute"}
+                        disabled={!!active && !ownership.controlling}
                         onClick={() => voice.setMuted(!voice.muted)}
                       >
                         {voice.muted ? (
@@ -851,6 +1125,7 @@ export default function Dashboard() {
                       </button>
                       <select
                         aria-label="Conversation speed"
+                        disabled={!!active && !ownership.controlling}
                         value={voice.rate}
                         onChange={(e) => voice.setRate(Number(e.target.value))}
                       >
@@ -864,6 +1139,7 @@ export default function Dashboard() {
                         <input
                           type="checkbox"
                           checked={voice.fast}
+                          disabled={!!active && !ownership.controlling}
                           onChange={(e) => voice.setFast(e.target.checked)}
                         />{" "}
                         Text only
@@ -872,13 +1148,19 @@ export default function Dashboard() {
                         <>
                           <button
                             className="button secondary"
-                            onClick={() => {
-                              voice.stop();
-                              void action({
-                                action:
-                                  call.status === "paused" ? "resume" : "pause",
+                            onClick={async () => {
+                              const resuming = call.status === "paused";
+                              locallyBlocked.current = true;
+                              interruptPlayback();
+                              if (resuming) ownership.claim();
+                              const result = await action({
+                                action: resuming ? "resume" : "pause",
                                 callId: call.id,
                               });
+                              if (resuming || !result) {
+                                locallyBlocked.current = false;
+                                wakePlayback((value) => value + 1);
+                              }
                             }}
                           >
                             {call.status === "paused" ? (
@@ -892,7 +1174,8 @@ export default function Dashboard() {
                             className="icon-button"
                             aria-label="Stop call"
                             onClick={() => {
-                              voice.stop();
+                              locallyBlocked.current = true;
+                              interruptPlayback();
                               void action({
                                 action: "cancel",
                                 callId: call.id,
@@ -905,20 +1188,98 @@ export default function Dashboard() {
                       ) : (
                         <button
                           className="button secondary"
-                          disabled={voice.speaking}
-                          onClick={() =>
-                            void voice.play(
-                              transcript,
-                              true,
-                              callCustomer?.voice,
-                            )
-                          }
+                          disabled={voice.speaking || replaying}
+                          onClick={() => void replayConversation()}
                         >
                           <Play size={14} /> Replay voice
                         </button>
                       )}
                     </div>
                   </section>
+                  {active && !ownership.controlling && (
+                    <div className="notice" role="status">
+                      {ownership.unavailable
+                        ? "This browser cannot coordinate live audio across tabs. Open the lab in a browser with Web Locks support."
+                        : "Live playback is controlled by another tab. This tab shows the conversation without starting another speaker."}
+                      {!ownership.unavailable && (
+                        <button
+                          className="text-button"
+                          onClick={() => ownership.claim()}
+                        >
+                          Play in this tab
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {caseDetails && (
+                    <section
+                      className="panel case-summary"
+                      aria-label="Case dynamics"
+                    >
+                      <div className="section-heading">
+                        <div>
+                          <h2>Case dynamics</h2>
+                          <p>{caseDetails.customerGoal}</p>
+                        </div>
+                        <Badge tone="amber">{caseDetails.difficulty}</Badge>
+                      </div>
+                      <div className="case-seed-row">
+                        <span>
+                          Seed <code>{caseDetails.seed}</code>
+                        </span>
+                        <button
+                          className="text-button"
+                          disabled={!!active}
+                          onClick={() => {
+                            setSelectedCustomer(call.customer_id);
+                            setSelectedScenario(
+                              caseDetails.selection || call.scenario,
+                            );
+                            setCaseSeed(caseDetails.seed);
+                            setDifficulty(caseDetails.difficulty);
+                            setAllowFollowUp(!!caseDetails.followUp);
+                            go("Overview");
+                          }}
+                        >
+                          Reuse this case
+                        </button>
+                      </div>
+                      {callPerformance && (
+                        <div className="case-metrics">
+                          <div>
+                            <strong>
+                              {callPerformance.supportTools} /{" "}
+                              {callPerformance.referenceTools}
+                            </strong>
+                            <span>Support tools / reference</span>
+                          </div>
+                          <div>
+                            <strong>{callPerformance.customerActions}</strong>
+                            <span>
+                              Actual customer UI actions
+                              {callPerformance.failedCustomerActions > 0 &&
+                                ` · ${callPerformance.failedCustomerActions} failed`}
+                            </span>
+                          </div>
+                          <div>
+                            <strong>{callPerformance.avoidableActions}</strong>
+                            <span>Avoidable actions</span>
+                          </div>
+                          <div>
+                            <strong>{callPerformance.failedTools}</strong>
+                            <span>Observed tool failures</span>
+                          </div>
+                        </div>
+                      )}
+                      <p className="panel-note">
+                        {caseDetails.followUp
+                          ? "One related follow-up is allowed if it remains unanswered. "
+                          : "No planned follow-up. "}
+                        Reference budgets help compare effort; a correctly
+                        handled engineering case does not require a repair.
+                      </p>
+                    </section>
+                  )}
                   <div className="live-grid">
                     <section className="panel conversation">
                       <div className="conversation-header">
@@ -978,14 +1339,20 @@ export default function Dashboard() {
                             <Loader2 className="spin" size={14} />
                             {voice.speaking
                               ? "Speaking…"
-                              : "Agent is investigating…"}
+                              : call.closing_customer_message_id
+                                ? "Closing the call…"
+                                : "Agent is investigating…"}
                           </div>
                         )}
                       </div>
                       <div className="transcript-footer">
                         <span className="dot" />
                         {terminal(call)
-                          ? "Conversation complete"
+                          ? call.status === "resolved" ||
+                            (call.status === "escalated" &&
+                              !!call.outcome_verified)
+                            ? "Conversation complete"
+                            : "Conversation ended"
                           : call.status === "paused"
                             ? "Paused · current request may finish"
                             : "Live transcript"}
@@ -1000,28 +1367,95 @@ export default function Dashboard() {
                   <div className="call-bottom">
                     <span>
                       <ShieldCheck size={16} />
-                      {call.verified
-                        ? "Application outcome independently verified"
-                        : "Resolution requires an actual application check"}
+                      {engineeringHandoff
+                        ? call.outcome_verified
+                          ? "Engineering handoff verified · customer accepted next steps"
+                          : "Engineering handoff recorded · awaiting customer acknowledgment"
+                        : call.repair_verified || call.verified
+                          ? (call.verified ||
+                              call.closing_customer_message_id) &&
+                            completionCheck
+                            ? `${call.scenario === "report_guidance" ? "Customer task" : "Repair"} verified · customer confirmed completion`
+                            : `${call.scenario === "report_guidance" ? "Customer task" : "Repair"} verified · customer completion not confirmed`
+                          : "Resolution requires a verified customer outcome and confirmation"}
                     </span>
                     <span>
-                      {call.tool_calls} tool calls · {call.escalations}{" "}
+                      {call.tool_calls} tool calls · {call.escalations} model
                       escalation{call.escalations === 1 ? "" : "s"} ·{" "}
                       {call.knowledge_used
                         ? "Knowledge used"
                         : "No knowledge used"}
                     </span>
                   </div>
+                  {completionCheck && (
+                    <section
+                      className="panel outcome"
+                      aria-label="Customer completion check"
+                    >
+                      <h3>
+                        {completionCheck.assessment_error
+                          ? "Completion review unavailable"
+                          : call.closing_customer_message_id && !terminal(call)
+                            ? "Customer confirmed · closing call"
+                            : call.verified || call.outcome_verified
+                              ? "Customer completion confirmed"
+                              : "Customer follow-up"}
+                      </h3>
+                      <p>
+                        {completionCheck.assessment_error
+                          ? "An application outcome is verified. The call is paused because the internal completion review was unavailable."
+                          : completionCheck.reason}
+                      </p>
+                      {completionCheck.assessment_error &&
+                        call.status === "paused" && (
+                          <>
+                            <button
+                              className="button secondary"
+                              disabled={loading || busy}
+                              onClick={() =>
+                                void action({
+                                  action: "resume",
+                                  callId: call.id,
+                                })
+                              }
+                            >
+                              Retry completion review
+                            </button>
+                            <details>
+                              <summary>Review diagnostics</summary>
+                              <p>{completionCheck.assessment_error}</p>
+                            </details>
+                          </>
+                        )}
+                      {JSON.parse(completionCheck.open_questions).length >
+                        0 && (
+                        <ul>
+                          {(
+                            JSON.parse(
+                              completionCheck.open_questions,
+                            ) as string[]
+                          ).map((question, index) => (
+                            <li key={index}>{question}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+                  )}
                   {terminal(call) && (
                     <div className="panel outcome">
                       <h3>
-                        {call.verified
-                          ? "Verified resolution"
-                          : "Call ended without a verified resolution"}
+                        {call.outcome === "engineering_handoff" &&
+                        call.outcome_verified
+                          ? "Engineering handoff verified · feature remains broken"
+                          : call.verified
+                            ? "Verified resolution"
+                            : call.status === "incomplete"
+                              ? "Incomplete · follow-up required"
+                              : "Call ended without a verified resolution"}
                       </h3>
                       <p>{call.learning_status}</p>
                       {call.error && <p className="error-text">{call.error}</p>}
-                      {call.verified &&
+                      {!!call.verified &&
                         call.learning_status.startsWith("Learning failed") && (
                           <button
                             className="button secondary"
@@ -1335,9 +1769,9 @@ export default function Dashboard() {
             <>
               <div className="metrics">
                 <Metric
-                  label="VERIFIED RESOLUTIONS"
-                  value={String(resolved.length)}
-                  detail={`${completed.filter((c) => !c.verified).length} unsuccessful calls`}
+                  label="HANDLED CORRECTLY"
+                  value={String(handled.length)}
+                  detail={`${resolved.length} resolved · ${handled.filter((c) => c.outcome === "engineering_handoff").length} engineering handoffs`}
                   icon={ShieldCheck}
                 />
                 <Metric
@@ -1361,6 +1795,96 @@ export default function Dashboard() {
                   icon={TrendingUp}
                 />
               </div>
+              <section className="panel performance-panel">
+                <div className="section-heading">
+                  <div>
+                    <h2>Effort and scenario difficulty</h2>
+                    <p>
+                      Compare the same setup before and after learning. A
+                      necessary failed reproduction is useful evidence, not
+                      automatically wasted effort.
+                    </p>
+                  </div>
+                </div>
+                <label>
+                  Compare case seed
+                  <select
+                    aria-label="Compare case seed"
+                    value={comparisonSeed}
+                    onChange={(event) => setComparisonSeed(event.target.value)}
+                  >
+                    <option value="all">
+                      All cases · different difficulty may affect results
+                    </option>
+                    {[
+                      ...new Set(
+                        completed.map((c) => c.scenario_seed).filter(Boolean),
+                      ),
+                    ].map((seed) => (
+                      <option key={seed} value={seed!}>
+                        {seed}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="case-metrics">
+                  <div>
+                    <strong>
+                      {comparedPerformance.reduce(
+                        (sum, p) => sum + p.avoidableActions,
+                        0,
+                      )}
+                    </strong>
+                    <span>Avoidable actions</span>
+                  </div>
+                  <div>
+                    <strong>
+                      {comparedPerformance.reduce(
+                        (sum, p) => sum + p.customerActions,
+                        0,
+                      )}
+                    </strong>
+                    <span>Customer UI steps</span>
+                  </div>
+                  <div>
+                    <strong>
+                      {comparedPerformance.reduce(
+                        (sum, p) =>
+                          sum + p.failedTools + p.failedCustomerActions,
+                        0,
+                      )}
+                    </strong>
+                    <span>Observed failures</span>
+                  </div>
+                  <div>
+                    <strong>
+                      {Math.round(
+                        comparedPerformance.reduce(
+                          (sum, p) => sum + p.toolMilliseconds,
+                          0,
+                        ),
+                      )}{" "}
+                      ms
+                    </strong>
+                    <span>Actual tool execution time</span>
+                  </div>
+                </div>
+                <details>
+                  <summary>How effort is counted</summary>
+                  <p>
+                    No-op configuration repairs, mismatched workflows,
+                    verification repeated after success without a new action,
+                    and retries of the same unrecoverable renderer defect count
+                    as avoidable. Reading records again is not automatically
+                    wasteful. Reference budgets are transparent comparison
+                    targets, not a model quality score. Voice playback and human
+                    pauses affect elapsed call time; tool time and token use are
+                    reported separately. Observed failures include support tools
+                    and customer UI attempts. Use the same seed, variation
+                    level, customer and models for a fair comparison.
+                  </p>
+                </details>
+              </section>
               <section className="panel">
                 <div className="section-heading">
                   <div>
@@ -1375,10 +1899,18 @@ export default function Dashboard() {
                 <div className="comparison-grid">
                   {scenarios.map((s) => {
                     const cold = completed.filter(
-                        (c) => c.scenario === s.id && !c.knowledge_used,
+                        (c) =>
+                          c.scenario === s.id &&
+                          !c.knowledge_used &&
+                          (comparisonSeed === "all" ||
+                            c.scenario_seed === comparisonSeed),
                       ),
                       warm = completed.filter(
-                        (c) => c.scenario === s.id && c.knowledge_used,
+                        (c) =>
+                          c.scenario === s.id &&
+                          c.knowledge_used &&
+                          (comparisonSeed === "all" ||
+                            c.scenario_seed === comparisonSeed),
                       );
                     const avg = (cs: Call[]) =>
                       cs.length
@@ -1417,14 +1949,22 @@ export default function Dashboard() {
                           <b>{tools(warm)}</b>
                         </div>
                         <div className="comparison-row">
-                          <span>Resolved</span>
+                          <span>Correct outcome</span>
                           <b>
-                            {cold.filter((c) => c.verified).length}/
-                            {cold.length}
+                            {
+                              cold.filter(
+                                (c) => c.outcome_verified || c.verified,
+                              ).length
+                            }
+                            /{cold.length}
                           </b>
                           <b>
-                            {warm.filter((c) => c.verified).length}/
-                            {warm.length}
+                            {
+                              warm.filter(
+                                (c) => c.outcome_verified || c.verified,
+                              ).length
+                            }
+                            /{warm.length}
                           </b>
                         </div>
                         <p>
@@ -1463,11 +2003,86 @@ export default function Dashboard() {
                   </IconEmpty>
                 )}
               </section>
+              <section
+                className="panel engineering-queue"
+                aria-label="Engineering queue"
+              >
+                <div className="section-heading">
+                  <div>
+                    <h2>Engineering queue</h2>
+                    <p>
+                      Evidence-backed cases pending engineering triage. A
+                      handoff leaves the feature unfixed and the support ticket
+                      open.
+                    </p>
+                  </div>
+                  <Badge tone="amber">
+                    {data.engineering?.length || 0} cases
+                  </Badge>
+                </div>
+                {data.engineering?.length ? (
+                  data.engineering.map((entry) => (
+                    <details className="engineering-case" key={entry.id}>
+                      <summary>
+                        <strong>
+                          {entry.id} · {entry.summary}
+                        </strong>
+                        <Badge tone="amber">
+                          {entry.status} · {entry.severity}
+                        </Badge>
+                      </summary>
+                      <p>
+                        <strong>Support ticket:</strong> {entry.ticket_id} · No
+                        confirmed repair time
+                      </p>
+                      <p>
+                        <strong>Customer impact:</strong>{" "}
+                        {entry.customer_impact}
+                      </p>
+                      <p>
+                        <strong>Expected:</strong> {entry.expected_result}
+                      </p>
+                      <p>
+                        <strong>Actual:</strong> {entry.actual_result}
+                      </p>
+                      <ol>
+                        {(JSON.parse(entry.reproduction_steps) as string[]).map(
+                          (step, index) => (
+                            <li key={index}>{step}</li>
+                          ),
+                        )}
+                      </ol>
+                      <details>
+                        <summary>
+                          Recorded reproduction and error evidence
+                        </summary>
+                        <pre>
+                          {JSON.stringify(JSON.parse(entry.evidence), null, 2)}
+                        </pre>
+                      </details>
+                      <button
+                        className="text-button"
+                        onClick={() => {
+                          setSelectedCall(entry.call_id);
+                          go("Live Simulation");
+                        }}
+                      >
+                        View source conversation <ArrowRight size={14} />
+                      </button>
+                    </details>
+                  ))
+                ) : (
+                  <p className="panel-note">
+                    No engineering cases yet. Run Broken report renderer to test
+                    investigation, evidence collection and an honest handoff.
+                  </p>
+                )}
+              </section>
               <section className="panel">
                 <div className="section-heading">
                   <h2>Model usage</h2>
                   <span className="mini-label">
-                    Customer, support & learning
+                    Customer, support, completion & learning
                   </span>
                 </div>
                 {data.usage.length ? (
@@ -1552,10 +2167,10 @@ export default function Dashboard() {
                           <h3>{profile}</h3>
                           <p>
                             {i === 0
-                              ? "Customer conversations & learning"
+                              ? "Customers, completion checks & learning"
                               : i === 1
                                 ? "Everyday investigation & tool use"
-                                : "Difficult cases after 2 unresolved turns"}
+                                : "Follow-ups after 2 exchanges without customer completion"}
                           </p>
                           <label>
                             Provider
@@ -1942,7 +2557,11 @@ function CallTable({
                           : "neutral"
                     }
                   >
-                    {c.verified ? "Verified" : c.status}
+                    {c.outcome === "engineering_handoff" && c.outcome_verified
+                      ? "Engineering handoff"
+                      : c.verified
+                        ? "Verified"
+                        : c.status}
                   </Badge>
                 </td>
                 <td>{c.turns}</td>
